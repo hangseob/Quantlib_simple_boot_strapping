@@ -1,8 +1,8 @@
 """
 KRW IRS Bootstrapping using QuantLib
-- Scenario 1: Piecewise Constant Instantaneous Forward (주어진 만기만 사용)
+- Scenario 1: Piecewise Linear Forward (주어진 만기만 사용)
 - Scenario 2: Linear Interpolation of IRS rates for intermediate maturities
-- Step Function Chart로 Forward Rate 비교
+- Instantaneous Forward Rate Chart로 비교
 """
 
 import QuantLib as ql
@@ -25,11 +25,16 @@ day_count = ql.Actual365Fixed()
 business_convention = ql.ModifiedFollowing
 settlement_days = 2
 
+# Overnight Deposit 금리
+overnight_rate = 0.04  
+
 # IRS 금리 데이터 (만기별) - 여기서 수정
 irs_rates = {
-    1: 0.02,
-    2: 0.04,
-    3: 0.05
+    1: 0.03,
+    2: 0.03,
+    3: 0.03,
+    4: 0.03,
+    5: 0.03
 }
 
 # 최대 만기 (자동 계산)
@@ -80,6 +85,19 @@ def create_irs_helpers(use_interpolation=False):
     """
     helpers = []
     
+    # Overnight Deposit Helper 추가 (spot date부터 시작하도록 fixing days = settlement_days)
+    overnight_quote = ql.QuoteHandle(ql.SimpleQuote(overnight_rate))
+    overnight_helper = ql.DepositRateHelper(
+        overnight_quote,
+        ql.Period(1, ql.Days),
+        settlement_days,  # fixing days = settlement_days로 설정하여 spot date부터 시작
+        calendar,
+        business_convention,
+        False,  # endOfMonth
+        day_count
+    )
+    helpers.append(overnight_helper)
+    
     if use_interpolation:
         # Scenario 2: 선형 보간 사용 - 0.25년 간격으로 모든 만기 생성
         num_quarters = int(max_maturity * 4)
@@ -121,8 +139,8 @@ def create_irs_helpers(use_interpolation=False):
 
 
 def build_curve(helpers):
-    """Piecewise Flat Forward로 커브 생성"""
-    curve = ql.PiecewiseFlatForward(settlement_days, calendar, helpers, day_count)
+    """Piecewise Linear Forward로 커브 생성"""
+    curve = ql.PiecewiseLinearForward(settlement_days, calendar, helpers, day_count)
     curve.enableExtrapolation()
     return curve
 
@@ -150,48 +168,44 @@ def calculate_quarterly_zero_rates(curve, maturities):
     return results
 
 
-def get_forward_rate_intervals(curve) -> List[Tuple[float, float, float]]:
-    """커브에서 3개월 forward rate 구간 데이터 추출"""
+def get_instantaneous_forward_rates(curve, num_points: int = 100) -> List[Tuple[float, float]]:
+    """커브에서 instantaneous forward rate 추출"""
     spot_date = curve.referenceDate()
-    intervals = []
-    num_quarters = int(max_maturity * 4)
+    rates = []
     
-    for i in range(num_quarters):
-        start_tenor = i * 0.25
-        end_tenor = (i + 1) * 0.25
+    for i in range(num_points + 1):
+        tenor = max_maturity * i / num_points
+        target_date = spot_date + ql.Period(int(tenor * 365), ql.Days)
         
-        start_date = spot_date + ql.Period(int(start_tenor * 12), ql.Months)
-        end_date = spot_date + ql.Period(int(end_tenor * 12), ql.Months)
-        
+        # Instantaneous forward rate (연속복리)
         fwd_rate = curve.forwardRate(
-            start_date, end_date, day_count, ql.Compounded, ql.Quarterly
+            target_date, target_date, day_count, ql.Continuous
         ).rate() * 100
         
-        intervals.append((start_tenor, end_tenor, fwd_rate))
+        rates.append((tenor, fwd_rate))
     
-    return intervals
+    return rates
 
 
 # ============================================================================
 # Step Function Chart
 # ============================================================================
 
-class MultiStepFunctionPlotter:
-    """여러 시나리오의 Step Function을 비교하는 그래프 생성"""
+class InstantaneousForwardPlotter:
+    """여러 시나리오의 Instantaneous Forward Rate을 비교하는 그래프 생성"""
     
     def __init__(self, figsize: Tuple[float, float] = (14, 8)):
         self.figsize = figsize
         self.scenarios = {}
         
-    def add_scenario(self, name: str, intervals: List[Tuple[float, float, float]]):
-        self.scenarios[name] = intervals
+    def add_scenario(self, name: str, rates: List[Tuple[float, float]]):
+        self.scenarios[name] = rates
         
     def plot(self,
-             title: str = "Forward Rate Comparison",
+             title: str = "Instantaneous Forward Rate Comparison",
              xlabel: str = "Time (Years)",
-             ylabel: str = "Forward Rate (%)",
+             ylabel: str = "Instantaneous Forward Rate (%)",
              colors: Optional[List[str]] = None,
-             show_values: bool = False,
              fill: bool = True,
              fill_alpha: float = 0.15,
              show_grid: bool = True,
@@ -205,45 +219,27 @@ class MultiStepFunctionPlotter:
         
         fig, ax = plt.subplots(figsize=self.figsize)
         
-        for idx, (name, intervals) in enumerate(self.scenarios.items()):
+        for idx, (name, rates) in enumerate(self.scenarios.items()):
             color = colors[idx % len(colors)]
-            sorted_data = sorted(intervals, key=lambda x: x[0])
             
-            # 수평선 그리기
-            for t_start, t_end, rate in sorted_data:
-                ax.hlines(y=rate, xmin=t_start, xmax=t_end, 
-                         colors=color, linewidth=2.5, 
-                         label=name if t_start == sorted_data[0][0] else None)
+            tenors = [t for t, _ in rates]
+            fwd_rates = [r for _, r in rates]
             
-            # 수직선 그리기
-            for i in range(len(sorted_data) - 1):
-                _, t_end, rate1 = sorted_data[i]
-                t_start_next, _, rate2 = sorted_data[i + 1]
-                if abs(t_end - t_start_next) < 1e-10:
-                    ax.vlines(x=t_end, ymin=min(rate1, rate2), ymax=max(rate1, rate2),
-                             colors=color, linewidth=2.5, linestyle='--', alpha=0.7)
+            # 선 그리기
+            ax.plot(tenors, fwd_rates, color=color, linewidth=2.5, label=name)
             
             # 영역 채우기
             if fill:
-                for t_start, t_end, rate in sorted_data:
-                    rect = patches.Rectangle(
-                        (t_start, 0), t_end - t_start, rate,
-                        linewidth=0, facecolor=color, alpha=fill_alpha
-                    )
-                    ax.add_patch(rect)
+                ax.fill_between(tenors, 0, fwd_rates, color=color, alpha=fill_alpha)
         
         # 축 설정
-        all_times = []
         all_rates = []
-        for intervals in self.scenarios.values():
-            for t_start, t_end, rate in intervals:
-                all_times.extend([t_start, t_end])
-                all_rates.append(rate)
+        for rates in self.scenarios.values():
+            all_rates.extend([r for _, r in rates])
         
-        x_margin = (max(all_times) - min(all_times)) * 0.05
         y_margin = max(all_rates) * 0.15
         
-        ax.set_xlim(min(all_times) - x_margin, max(all_times) + x_margin)
+        ax.set_xlim(0, max_maturity)
         ax.set_ylim(0, max(all_rates) + y_margin)
         
         ax.set_xlabel(xlabel, fontsize=12, fontweight='bold')
@@ -276,9 +272,10 @@ class MultiStepFunctionPlotter:
 
 def main():
     print("=" * 80)
-    print("KRW IRS Bootstrapping 비교")
+    print("KRW IRS Bootstrapping (Piecewise Linear Forward)")
     print("=" * 80)
     print(f"\n기준일: {today}")
+    print(f"\nOvernight Deposit 금리: {overnight_rate*100:.2f}%")
     print(f"\n입력 IRS 금리:")
     for years, rate in sorted(irs_rates.items()):
         print(f"  {years}년: {rate*100:.2f}%")
@@ -287,80 +284,38 @@ def main():
     num_quarters = int(max_maturity * 4)
     maturities = [i * 0.25 for i in range(1, num_quarters + 1)]
     
-    # Scenario 1: 주어진 만기만 사용
+    # 커브 생성
     print("\n" + "-" * 80)
-    print("Scenario 1: Piecewise Constant Instantaneous Forward (주어진 만기만 사용)")
+    print("Piecewise Linear Forward 커브 생성")
     print("-" * 80)
     
-    helpers1 = create_irs_helpers(use_interpolation=False)
-    curve1 = build_curve(helpers1)
-    results1 = calculate_quarterly_zero_rates(curve1, maturities)
-    intervals1 = get_forward_rate_intervals(curve1)
+    helpers = create_irs_helpers(use_interpolation=False)
+    curve = build_curve(helpers)
+    results = calculate_quarterly_zero_rates(curve, maturities)
+    fwd_rates = get_instantaneous_forward_rates(curve)
     
-    # Scenario 2: 선형 보간 사용
-    print("\n" + "-" * 80)
-    print("Scenario 2: 선형 보간된 IRS 금리 사용")
-    print("-" * 80)
-    
-    # 보간된 금리 출력
-    print("\n보간된 IRS 금리:")
-    for i in range(1, num_quarters + 1):
-        tenor = i * 0.25
-        rate = get_interpolated_rate(tenor)
-        print(f"  {tenor:.2f}년: {rate*100:.4f}%")
-    
-    helpers2 = create_irs_helpers(use_interpolation=True)
-    curve2 = build_curve(helpers2)
-    results2 = calculate_quarterly_zero_rates(curve2, maturities)
-    intervals2 = get_forward_rate_intervals(curve2)
-    
-    # Zero Rate 비교
+    # Zero Rate 출력
     print("\n" + "=" * 80)
-    print("Quarterly Compounding Zero Rate 비교")
+    print("Quarterly Compounding Zero Rate")
     print("=" * 80)
     
-    df1 = pd.DataFrame(results1)
-    df2 = pd.DataFrame(results2)
-    
-    comparison = pd.DataFrame({
-        'Tenor (Years)': df1['Tenor (Years)'],
-        'Scenario 1 (%)': df1['Zero Rate (%)'],
-        'Scenario 2 (%)': df2['Zero Rate (%)'],
-        'Difference (bp)': (df1['Zero Rate (%)'] - df2['Zero Rate (%)']) * 100
-    })
-    
+    df = pd.DataFrame(results)
     print("\n")
-    print(comparison.to_string(index=False, float_format='%.6f'))
+    print(df.to_string(index=False, float_format='%.6f'))
     
-    # Forward Rate 비교
+    # Instantaneous Forward Rate Chart 그리기
     print("\n" + "=" * 80)
-    print("3개월 Forward Rate 비교")
+    print("Instantaneous Forward Rate Chart 생성 중...")
     print("=" * 80)
     
-    fwd_comparison = pd.DataFrame({
-        'Period': [f'{s:.2f}Y - {e:.2f}Y' for s, e, _ in intervals1],
-        'Scenario 1 (%)': [r for _, _, r in intervals1],
-        'Scenario 2 (%)': [r for _, _, r in intervals2],
-        'Difference (bp)': [(r1 - r2) * 100 for (_, _, r1), (_, _, r2) in zip(intervals1, intervals2)]
-    })
-    
-    print("\n")
-    print(fwd_comparison.to_string(index=False, float_format='%.6f'))
-    
-    # Step Function Chart 그리기
-    print("\n" + "=" * 80)
-    print("Step Function Chart 생성 중...")
-    print("=" * 80)
-    
-    plotter = MultiStepFunctionPlotter(figsize=(16, 8))
-    plotter.add_scenario("Scenario 1: Piecewise Constant (원본 만기만)", intervals1)
-    plotter.add_scenario("Scenario 2: Linear Interpolation (보간)", intervals2)
+    plotter = InstantaneousForwardPlotter(figsize=(16, 8))
+    plotter.add_scenario("Piecewise Linear Forward", fwd_rates)
     
     plotter.plot(
-        title=f"3-Month Forward Rate Comparison (IRS: {', '.join([f'{y}Y={r*100:.0f}%' for y, r in sorted(irs_rates.items())])})",
+        title=f"Instantaneous Forward Rate (O/N={overnight_rate*100:.0f}%, IRS: {', '.join([f'{y}Y={r*100:.0f}%' for y, r in sorted(irs_rates.items())])})",
         xlabel="Time (Years)",
-        ylabel="3M Forward Rate (%)",
-        colors=['#2563eb', '#dc2626'],
+        ylabel="Instantaneous Forward Rate (%)",
+        colors=['#2563eb'],
         fill=True,
         fill_alpha=0.15,
         save_path="forward_rate_comparison.png"
